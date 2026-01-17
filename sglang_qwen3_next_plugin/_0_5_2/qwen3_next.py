@@ -1023,9 +1023,13 @@ class Qwen3NextForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
+        # MODIFIED: When num_experts=0, use 1 as num_logical_experts to avoid empty sequence error
+        # This is safe because when num_experts=0, we use regular MLP instead of MoE
+        num_experts = getattr(config, "num_experts", 0)
+        num_logical_experts = num_experts if num_experts > 0 else 1
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
+            num_logical_experts=num_logical_experts,
             num_groups=None,
         )
 

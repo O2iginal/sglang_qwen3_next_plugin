@@ -1,7 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sglang-qwen3-next-plugin"
 version = "0.1.0"
-description = "Add your description here"
+description = "Custom SGLang plugin for Qwen3 Next model with custom modifications"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.10"
+dependencies = [
+    "sglang>=0.5.0",
+    "torch",
+    "transformers",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]

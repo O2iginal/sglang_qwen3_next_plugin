@@ -875,6 +875,14 @@ class Qwen3NextForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Plugin indicator: colored print to show plugin is loaded
+        print(
+            "\033[92m"  # Green color
+            "=" * 80 + "\n"
+            "  ✓ SGLang Qwen3 Next Plugin Loaded Successfully!\n"
+            "  ✓ Custom model implementation is active.\n"
+            "=" * 80 + "\033[0m"  # Reset color
+        )
         self.config = config
         self.pp_group = get_pp_group()
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank

@@ -21,18 +21,22 @@ pip install .
 
 ## 使用方法
 
-### 方式 1: 环境变量自动加载（推荐）
+### 方式 1: 环境变量自动加载（推荐，必须设置）
 
-设置环境变量后，SGLang 会自动加载插件：
+**重要：必须设置环境变量，否则插件不会被加载！**
 
 ```bash
+# 设置环境变量
 export SGLANG_EXTERNAL_MODEL_PACKAGE="sglang_qwen3_next_plugin"
 
 # 启动 SGLang 服务器
 python3 -m sglang.launch_server \
-  --model <your_qwen3_next_model_path> \
+  --model-path <your_qwen3_next_model_path> \
+  --port 30110 \
   --tp 1
 ```
+
+**注意**：环境变量必须在启动命令的同一 shell 会话中设置，或者添加到 `~/.bashrc` 或 `~/.zshrc` 中。
 
 启动时，您应该会看到绿色的成功提示信息，表明插件已成功加载：
 
@@ -43,7 +47,7 @@ python3 -m sglang.launch_server \
 ================================================================================
 ```
 
-### 方式 2: 手动注册
+### 方式 2: 手动注册（用于调试）
 
 在代码中手动注册插件模型：
 

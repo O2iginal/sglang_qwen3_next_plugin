@@ -8,6 +8,8 @@ The plugin can be loaded via environment variable SGLANG_EXTERNAL_MODEL_PACKAGE.
 from sglang_qwen3_next_plugin._0_5_2.qwen3_next import Qwen3NextForCausalLM
 
 # Export the model class for ModelRegistry
-EntryClass = [Qwen3NextForCausalLM]
+# EntryClass can be a single class or a list of classes
+# ModelRegistry will use the class __name__ as the architecture name
+EntryClass = Qwen3NextForCausalLM
 
 __all__ = ["Qwen3NextForCausalLM", "EntryClass"]

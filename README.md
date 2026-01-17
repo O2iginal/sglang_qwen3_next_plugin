@@ -74,10 +74,17 @@ llm = sgl.Engine(model_path="./path/to/model")
 
 ## 自定义修改
 
-当前插件在 `Qwen3NextForCausalLM.__init__` 方法中添加了彩色打印，作为插件加载成功的标识。
+本插件对 Qwen3 Next 模型进行了以下自定义修改（所有修改都在代码中标注了 `MODIFIED` 注释）：
 
-要添加更多自定义修改，请编辑：
-- `sglang_qwen3_next_plugin/_0_5_2/qwen3_next.py`
+1. **LayerNorm 替换**: 将 `GemmaRMSNorm` 替换为普通 `RMSNorm`
+2. **移除 QK Norm**: 删除了 `q_norm` 和 `k_norm` 相关逻辑和参数
+3. **Attention Bias 设置**: 
+   - `qkv_proj` 默认开启 `bias=True`
+   - `o_proj` 默认关闭 `bias=False`
+4. **支持普通 MLP**: 当 `num_experts=0` 时，使用普通 MLP 而非 MoE
+5. **默认关闭 Gate**: `attn_output_gate` 默认设置为 `False`
+
+所有修改都在 `sglang_qwen3_next_plugin/_0_5_2/qwen3_next.py` 文件中，并在 `Qwen3NextForCausalLM.__init__` 方法中添加了彩色打印，作为插件加载成功的标识。
 
 ## 项目结构
 

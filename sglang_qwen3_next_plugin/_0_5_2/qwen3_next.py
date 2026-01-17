@@ -23,7 +23,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -493,8 +493,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
 
+        # MODIFIED: Support num_experts=0 to use regular MLP instead of MoE
         # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
+        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
         is_previous_layer_sparse = True
         self.layer_id = layer_id
 
@@ -519,8 +520,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_communicator = LayerCommunicator(
@@ -602,7 +604,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        # MODIFIED: Default disable attn_output_gate (changed from True to False)
+        self.attn_output_gate = getattr(config, "attn_output_gate", False)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -617,12 +620,13 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),  # see impl of get_rope
         )
 
+        # MODIFIED: qkv_proj default bias=True, o_proj default bias=False
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=False,
+            bias=True,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -647,8 +651,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # MODIFIED: Support num_experts=0 to use regular MLP instead of MoE
         # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
+        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
         is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -672,13 +677,13 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
+        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # MODIFIED: Removed q_norm and k_norm (lines 680-682)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -689,27 +694,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
+    # MODIFIED: Removed _apply_qk_norm method (q_norm and k_norm are removed)
 
     def self_attention(
         self,
@@ -731,8 +716,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-
+        # MODIFIED: Removed q_norm and k_norm application
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -818,7 +802,8 @@ class Qwen3NextModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
 
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
     def forward(

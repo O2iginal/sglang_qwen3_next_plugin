@@ -779,6 +779,18 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
+        # MODIFIED: Fix full_attention_interval = 0 to avoid ZeroDivisionError in layers_block_type
+        # Only fix when it's explicitly 0 (which causes division by zero in layers_block_type property)
+        # We don't modify valid interval values to preserve the model's intended layer configuration
+        # Note: If the model has all linear_attention layers (full_attention_layer_ids is empty),
+        # SGLang's profile_max_num_token will have cell_size=0 issue, but that's a SGLang bug
+        # and we cannot fix it without changing model behavior.
+        if hasattr(config, 'full_attention_interval') and getattr(config, 'full_attention_interval', None) == 0:
+            # When full_attention_interval is 0, it causes ZeroDivisionError in layers_block_type property
+            # We set it to a non-zero value to prevent the error, but this should not happen in normal cases
+            # The model config should have the correct value from the checkpoint
+            config.full_attention_interval = 1
+
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -957,6 +969,11 @@ class Qwen3NextForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            # MODIFIED: Skip qkqkv_proj and q_norm/k_norm related parameters
+            # These were removed in our custom implementation
+            if "qkqkv_proj" in name or "q_norm" in name or "k_norm" in name:
+                continue
+
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
@@ -1012,6 +1029,13 @@ class Qwen3NextForCausalLM(nn.Module):
                         continue
                     # if is_pp_missing_parameter(name, self):
                     #     continue
+                    
+                    # MODIFIED: Skip parameters that don't exist in the model
+                    # This handles cases where weight files contain parameters that were removed
+                    # (e.g., qkqkv_proj related to removed q_norm/k_norm)
+                    if name not in params_dict:
+                        # Skip parameters that don't exist (e.g., qkqkv_proj after removing q_norm/k_norm)
+                        continue
 
                     param = params_dict[name]
                     weight_loader = getattr(
@@ -1023,8 +1047,10 @@ class Qwen3NextForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        # MODIFIED: When num_experts=0, use 1 as num_logical_experts to avoid empty sequence error
-        # This is safe because when num_experts=0, we use regular MLP instead of MoE
+        # MODIFIED: When num_experts=0 (non-MoE model), use 1 as num_logical_experts
+        # This is necessary because SGLang's expert location computation requires
+        # at least 1 logical expert. For non-MoE models, we treat the regular MLP
+        # as a single expert.
         num_experts = getattr(config, "num_experts", 0)
         num_logical_experts = num_experts if num_experts > 0 else 1
         return ModelConfigForExpertLocation(

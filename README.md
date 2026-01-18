@@ -6,7 +6,8 @@
 
 - ✅ 基于 SGLang v0.5.2 的 Qwen3 Next 实现
 - ✅ 插件化架构，无需修改 SGLang 源码
-- ✅ 支持通过环境变量自动加载
+- ✅ 支持多种加载方式（包装脚本、环境变量、手动注册）
+- ✅ 自动修复常见配置问题（expert location、full_attention_interval）
 - ✅ 可扩展的自定义修改接口
 
 ## 安装
@@ -21,12 +22,43 @@ pip install .
 
 ## 使用方法
 
-### 方式 1: 环境变量自动加载（推荐，必须设置）
+### 方式 1: 使用包装脚本（推荐，最简单）
 
-**重要：必须设置环境变量，否则插件不会被加载！**
+**推荐使用此方式，无需设置环境变量，插件会自动注册！**
 
 ```bash
-# 设置环境变量
+# 直接使用包装脚本启动
+python -m sglang_qwen3_next_plugin.launch_server \
+  --model-path <your_qwen3_next_model_path> \
+  --port 30110 \
+  --tp 1
+```
+
+**完整示例：**
+```bash
+source /path/to/venv/bin/activate
+hf_path=/path/to/your/model
+python -m sglang_qwen3_next_plugin.launch_server \
+  --model-path $hf_path \
+  --port 30110 \
+  --tp 1
+```
+
+启动时，您应该会看到绿色的成功提示信息，表明插件已成功加载：
+
+```
+================================================================================
+  ✓ SGLang Qwen3 Next Plugin Loaded Successfully!
+  ✓ Custom model implementation is active.
+================================================================================
+```
+
+### 方式 2: 环境变量 + 原始命令
+
+如果希望使用原始的 `sglang.launch_server` 命令：
+
+```bash
+# 设置环境变量（必须在导入 SGLang 之前）
 export SGLANG_EXTERNAL_MODEL_PACKAGE="sglang_qwen3_next_plugin"
 
 # 启动 SGLang 服务器
@@ -38,29 +70,21 @@ python3 -m sglang.launch_server \
 
 **注意**：环境变量必须在启动命令的同一 shell 会话中设置，或者添加到 `~/.bashrc` 或 `~/.zshrc` 中。
 
-启动时，您应该会看到绿色的成功提示信息，表明插件已成功加载：
-
-```
-================================================================================
-  ✓ SGLang Qwen3 Next Plugin Loaded Successfully!
-  ✓ Custom model implementation is active.
-================================================================================
-```
-
-### 方式 2: 手动注册（用于调试）
+### 方式 3: 手动注册（用于调试或编程使用）
 
 在代码中手动注册插件模型：
 
 ```python
-from sglang.srt.models.registry import ModelRegistry
-from sglang_qwen3_next_plugin import Qwen3NextForCausalLM
+import sglang_qwen3_next_plugin
+from sglang_qwen3_next_plugin import register
 
-# 注册模型
-ModelRegistry.models["Qwen3NextForCausalLM"] = Qwen3NextForCausalLM
+# 注册模型（会自动覆盖原始模型）
+register()
 
 # 然后正常使用 SGLang
-import sglang as sgl
-llm = sgl.Engine(model_path="./path/to/model")
+from sglang.srt.models.registry import ModelRegistry
+# 验证注册
+assert "Qwen3NextForCausalLM" in ModelRegistry.models
 ```
 
 ## 模型配置要求
@@ -87,8 +111,10 @@ llm = sgl.Engine(model_path="./path/to/model")
    - `o_proj` 默认关闭 `bias=False`
 4. **支持普通 MLP**: 当 `num_experts=0` 时，使用普通 MLP 而非 MoE
 5. **默认关闭 Gate**: `attn_output_gate` 默认设置为 `False`
+6. **修复 Expert Location**: 当 `num_experts=0` 时，`num_logical_experts` 设置为 1，避免空数组错误
+7. **修复 full_attention_interval**: 当 `full_attention_interval=0` 时，自动修复以避免除零错误
 
-所有修改都在 `sglang_qwen3_next_plugin/_0_5_2/qwen3_next.py` 文件中，并在 `Qwen3NextForCausalLM.__init__` 方法中添加了彩色打印，作为插件加载成功的标识。
+所有修改都在 `sglang_qwen3_next_plugin/qwen3_next.py` 文件中，并在 `Qwen3NextForCausalLM.__init__` 方法中添加了彩色打印，作为插件加载成功的标识。
 
 ## 项目结构
 
@@ -98,29 +124,58 @@ sglang_qwen3_next_plugin/
 ├── README.md               # 本文件
 ├── plan.md                 # 开发计划
 ├── sglang_qwen3_next_plugin/
-│   ├── __init__.py         # 包初始化，模型注册
-│   └── _0_5_2/
+│   ├── __init__.py         # 包初始化，包含自动注册逻辑
+│   ├── qwen3_next.py       # 自定义的 Qwen3 Next 模型实现（包含 EntryClass）✅
+│   ├── launch_server.py    # 包装脚本，用于自动注册插件
+│   ├── models/             # 保留用于参考
+│   │   ├── __init__.py
+│   │   └── qwen3_next.py
+│   └── _0_5_2/            # 旧版本目录（保留用于参考）
 │       ├── __init__.py
-│       └── qwen3_next.py  # 自定义的 Qwen3 Next 模型实现
+│       └── qwen3_next.py
 ```
+
+**重要**：模型文件 `qwen3_next.py` 必须放在包根目录下，因为 SGLang 的 `import_model_classes` 函数只会扫描包的直接子模块，不会递归扫描嵌套的子包。文件中的 `EntryClass` 会被自动发现。
 
 ## 开发
 
 ### 添加自定义功能
 
-1. 编辑 `sglang_qwen3_next_plugin/_0_5_2/qwen3_next.py`
+1. 编辑 `sglang_qwen3_next_plugin/qwen3_next.py`
 2. 在 `Qwen3NextForCausalLM` 类中添加您的自定义逻辑
-3. 重新安装插件：`pip install -e .`
-4. 测试您的修改
+3. 确保文件末尾有 `EntryClass = Qwen3NextForCausalLM` 定义
+4. 重新安装插件：`pip install -e .`
+5. 测试您的修改
 
 ### 调试
 
 如果插件未加载，请检查：
 
-1. 环境变量是否正确设置
-2. 插件包是否正确安装
-3. 模型的 `config.json` 中 `architectures` 字段是否正确
-4. SGLang 版本是否兼容（当前基于 v0.5.2）
+1. **使用包装脚本（推荐）**：使用 `python -m sglang_qwen3_next_plugin.launch_server` 而不是原始命令
+2. **插件包是否正确安装**：运行 `pip install -e .` 重新安装
+3. **模型文件位置**：确保 `qwen3_next.py` 在包根目录下（`sglang_qwen3_next_plugin/qwen3_next.py`）
+4. **EntryClass 定义**：确保 `qwen3_next.py` 文件末尾有 `EntryClass = Qwen3NextForCausalLM`
+5. **模型的 `config.json`**：确保 `architectures` 字段为 `["Qwen3NextForCausalLM"]`
+6. **SGLang 版本**：当前基于 v0.5.2
+
+**验证插件是否加载：**
+
+启动时应该看到绿色的成功提示：
+```
+================================================================================
+  ✓ SGLang Qwen3 Next Plugin Loaded Successfully!
+  ✓ Custom model implementation is active.
+================================================================================
+```
+
+如果看到这个提示，说明插件已成功加载。
+
+**为什么模型文件要在包根目录？**
+
+SGLang 的 `import_model_classes` 函数使用 `pkgutil.iter_modules` 扫描包，它只会扫描**直接子模块**，不会递归扫描嵌套的子包，也不会包含 `__init__.py`。因此：
+- ✅ `sglang_qwen3_next_plugin.qwen3_next` 会被扫描到（包根目录）
+- ❌ `sglang_qwen3_next_plugin.models.qwen3_next` 不会被扫描到（`models` 是子包）
+- ❌ `sglang_qwen3_next_plugin._0_5_2.qwen3_next` 不会被扫描到（`_0_5_2` 是子包）
 
 ## 版本兼容性
 

@@ -1,119 +1,134 @@
 # SGLang Qwen3 Next Plugin
 
-这是一个 SGLang 插件，用于自定义修改 Qwen3 Next 模型的推理行为。通过插件机制，可以在不修改 SGLang 源码的情况下替换原有的模型实现。
+这是一个用于替换 `Qwen3NextForCausalLM` 实现的 SGLang 外部插件仓库。目标不是演示级插件，而是让自定义 Qwen3 Next checkpoint 在不同版本的 `sglang` 中都能以原生插件入口稳定运行。
+
+当前 release 版本：`0.2.0`
 
 ## 功能特性
 
-- ✅ 基于 SGLang v0.5.2 的 Qwen3 Next 实现
-- ✅ 插件化架构，无需修改 SGLang 源码
-- ✅ 主入口支持 `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin`
-- ✅ 已接通 checkpoint 显式 `layer_types`
-- ✅ 已修复 Hybrid GDN 在线性注意力路径上的关键运行时兼容问题
-- ✅ 提供可复用的生成验收脚本
+- ✅ 同时适配 `sglang 0.5.2` 与 `sglang 0.5.9`
+- ✅ 主入口统一为 `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin`
+- ✅ 仓库按 `upstream / variants / compat / versioning` 分层组织
+- ✅ 已支持 checkpoint 显式 `layer_types`
+- ✅ 已完成真实服务级生成与 logprob 验收
+- ✅ 提供可复用的轻量验收与完整验收脚本
 
 ## 安装
 
 ```bash
-# 开发模式安装
 pip install -e .
+```
 
-# 或者常规安装
+或：
+
+```bash
 pip install .
 ```
 
 ## 使用方法
 
-### 环境变量 + 原始命令
-
-当前推荐并作为主验收标准的启动方式：
+推荐的主入口：
 
 ```bash
 source /path/to/venv/bin/activate
-export SGLANG_EXTERNAL_MODEL_PACKAGE="sglang_qwen3_next_plugin"
+export SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin
 
 python -m sglang.launch_server \
-  --model-path <your_qwen3_next_model_path> \
+  --model-path <your_model_path> \
+  --host 127.0.0.1 \
   --port 30110 \
   --tp 1
 ```
 
 注意：
+
 - 环境变量必须在 Python 进程启动前设置
-- 当前仓库中仍保留少量接入层兼容逻辑，因为目标环境里的 `sglang 0.5.2` 本地实现并不会直接消费这个环境变量
-- 若未来上游版本原生支持外部模型包，应优先删除兼容层并回归上游机制
+- `sglang 0.5.2` 仍需要仓库内的接入层兼容逻辑
+- `sglang 0.5.9` 已原生支持外部模型包发现
+- 若新环境中存在与当前 `torch` ABI 不兼容的 `vllm`，应先移除再做插件验收
 
-启动时，您应该看到绿色成功提示。当前实现会做到“每个进程只打印一次”，避免多层重复刷屏。
+## 当前支持状态
 
-## 模型配置要求
-
-确保您的模型目录中的 `config.json` 包含正确的架构名称：
-
-```json
-{
-  "architectures": [
-    "Qwen3NextForCausalLM"
-  ],
-  ...
-}
-```
+- `sglang 0.5.2`
+  - 插件发现、registry 接管、自然语言生成、logprob 验收均已通过
+- `sglang 0.5.9`
+  - 插件发现、registry 接管、真实服务启动、自然语言生成、logprob 验收均已通过
 
 ## 自定义修改
 
-本插件当前包含两类修改：
+本仓库当前包含两类修改。
 
-1. 结构性 checkpoint 对齐
-   - 将 `GemmaRMSNorm` 替换为普通 `RMSNorm`
-   - 移除 `q_norm` / `k_norm`
-   - `qkv_proj` 开启 bias，`o_proj` 保持无 bias
-   - `attn_output_gate` 默认按 checkpoint 需要关闭
+1. 公共 checkpoint 结构定制
+   - `GemmaRMSNorm -> RMSNorm`
+   - 移除 `q_norm / k_norm`
+   - `qkv_proj` 使用 bias
+   - `attn_output_gate` 默认关闭
    - `num_experts=0` 时走普通 MLP 路径
+   - `num_experts=0` 时 expert-location 兜底为 1 个逻辑 expert
 
-2. SGLang 0.5.2 运行时兼容补丁
-   - 显式接通 `layer_types`，避免错误依赖 `full_attention_interval`
-   - 将 Hybrid GDN backend 切到稳定 `causal_conv1d_fn`
-   - 在 `ModelRunner.init_memory_pool()` 同步真实运行 dtype，修复 `conv_state` 分配类型错误
+2. 按版本区分的运行时 compat
+   - `sglang 0.5.2`
+     - `layer_types` compat
+     - hybrid linear attention backend 切换
+     - `ModelRunner.init_memory_pool()` dtype patch
+     - `sitecustomize.py` / `env_override.py` 接入层
+   - `sglang 0.5.9`
+     - `layer_types` compat
+     - 当前没有证据表明还需要继承 `0.5.2` 的 dtype patch 或 hybrid backend patch
 
 详细原因与升级复核点请看：
+
 - `progress.md`
 - `changelog.md`
+- `.codex/skills/sglang-plugin-version-adaptation/SKILL.md`
 
 ## 项目结构
 
-```
+```text
 sglang_qwen3_next_plugin/
-├── pyproject.toml          # 项目配置
-├── README.md               # 本文件
-├── progress.md             # 中文进度记录
-├── changelog.md            # 相对上游的变更与升级复核点
-├── sitecustomize.py        # 环境变量主入口接入层
+├── pyproject.toml
+├── README.md
+├── progress.md
+├── changelog.md
+├── sitecustomize.py
 ├── scripts/
 │   ├── check_plugin_import.py
 │   ├── run_acceptance.py
 │   ├── validate_generation.py
 │   └── validate_logprob.py
 ├── sglang_qwen3_next_plugin/
-│   ├── __init__.py         # 仅导出 EntryClass
-│   ├── env_override.py     # 插件发现兼容层
-│   ├── qwen3_next.py       # 当前插件实现
-│   └── qwen3_next_upstream.py
-└── docs/
-    └── superpowers/
+│   ├── __init__.py
+│   ├── qwen3_next.py
+│   ├── versioning.py
+│   ├── env_override.py
+│   ├── compat/
+│   ├── upstream/
+│   │   ├── sglang_0_5_2/
+│   │   └── sglang_0_5_9/
+│   └── variants/
+│       ├── sglang_0_5_2.py
+│       └── sglang_0_5_9.py
+├── tests/
+└── .codex/skills/sglang-plugin-version-adaptation/
 ```
 
 说明：
-- 当前文档以“主入口 + 上游基线 + 插件实现 + 中文记录”这套结构为准
-- 历史试验目录不再作为当前方案依赖
+
+- `qwen3_next.py` 现在是按版本分发的入口，不再是单一版本实现
+- `variants/` 放各版本实际模型实现
+- `compat/` 放各版本运行时兼容补丁
+- `upstream/` 放各版本上游快照，作为升级对照基线
 
 ## 验证
 
-### 验证插件导入契约
+### 插件导入契约
 
 ```bash
 source /path/to/venv/bin/activate
 XDG_CACHE_HOME=/tmp HOME=/tmp python test_plugin.py
 ```
 
-### 验证插件是否接管 registry
+### 插件 registry 接管
 
 ```bash
 source /path/to/venv/bin/activate
@@ -122,37 +137,37 @@ XDG_CACHE_HOME=/tmp HOME=/tmp \
 python scripts/check_plugin_import.py
 ```
 
-### 验证自然语言生成
+### 自然语言生成
 
-服务启动后，执行：
+服务启动后执行：
 
 ```bash
 source /path/to/venv/bin/activate
 python scripts/validate_generation.py --host 127.0.0.1 --port 30110
 ```
 
-该脚本会发送中英文最小样例并输出：
-- 生成文本
-- `output_ids` 前缀
-- `PASS` / `FAIL`
+### 快速聊天冒烟测试
 
-### 验证 logprob / 近似 lm loss
+如果只想快速打一条 OpenAI 兼容 `chat/completions` 请求，可以执行：
 
-服务启动后，执行：
+```bash
+bash scripts/chat_smoke.sh
+```
+
+默认会请求 `127.0.0.1:30110`，发送提示词“简短介绍一下你自己，用中文回答”。常用覆盖方式：
+
+```bash
+CHAT_PORT=30110 CHAT_PROMPT="简短介绍一下你自己，用中文回答" bash scripts/chat_smoke.sh
+```
+
+### logprob / 近似 lm loss
+
+服务启动后执行：
 
 ```bash
 source /path/to/venv/bin/activate
 python scripts/validate_logprob.py --host 127.0.0.1 --port 30110
 ```
-
-该脚本会：
-- 请求服务返回 prompt token 的 logprob
-- 计算平均负对数似然 `avg_nll`
-- 给出一个宽松阈值判断，排除“模型路径明显坏掉”的情况
-
-当前实测量级：
-- 中文样例：`avg_nll ≈ 4.30`
-- 英文样例：`avg_nll ≈ 3.11`
 
 ### 一条命令串联验收
 
@@ -170,15 +185,17 @@ source /path/to/venv/bin/activate
 python scripts/run_acceptance.py --host 127.0.0.1 --port 30110
 ```
 
+当前 `sglang 0.5.9` 真实环境已实测返回 `ALL CHECKS PASSED`。
+
 ## 开发
 
 ### 添加自定义功能
 
-1. 编辑 `sglang_qwen3_next_plugin/qwen3_next.py`
-2. 在 `Qwen3NextForCausalLM` 类中添加您的自定义逻辑
-3. 确保文件末尾有 `EntryClass = Qwen3NextForCausalLM` 定义
+1. 先确认目标版本应修改哪个 `variants/sglang_x_y_z.py`
+2. 结构性定制优先写入对应 `variants/`
+3. 运行时缺口优先写入对应 `compat/sglang_x_y_z.py`
 4. 重新安装插件：`pip install -e .`
-5. 测试您的修改
+5. 运行验收脚本
 
 ### 调试
 
@@ -190,14 +207,22 @@ python scripts/run_acceptance.py --host 127.0.0.1 --port 30110
 4. `scripts/check_plugin_import.py` 是否显示 registry 已指向插件实现
 5. `scripts/validate_generation.py` 与 `scripts/validate_logprob.py` 是否仍返回 `PASS`
 
-说明：
-- 当前 README 只保留真实仍在使用的链路
-- 更细的排障过程和根因链请看 `progress.md`
+若后续需要给仓库新增 `sglang` 版本支持，请优先参考：
+
+- `.codex/skills/sglang-plugin-version-adaptation/SKILL.md`
+
+## 发布说明
+
+- 当前 release：`0.2.0`
+- 该版本首次把仓库整理为多版本插件结构
+- 该版本确认：
+  - `sglang 0.5.2` 验收通过
+  - `sglang 0.5.9` 验收通过
 
 ## 版本兼容性
 
-- SGLang: >= 0.5.0
-- Python: >= 3.10
+- SGLang: `0.5.2`, `0.5.9`
+- Python: `>= 3.10`
 
 ## 许可证
 

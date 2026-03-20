@@ -214,3 +214,360 @@
     - logprob / 近似 lm loss
 - 目的：
   - 后续升级 SGLang 后，可以先跑轻量验收，再跑完整服务验收
+
+### Phase 11: 多版本适配设计启动
+- 新需求：
+  - 目标仓库不再只适配 `sglang==0.5.2`
+  - 需要同时面向旧版本与新版本官方 `sglang` 主包进行插件适配
+  - 还需要沉淀一个项目级 skill，指导未来继续新增 `sglang` 版本支持
+- 已确认的新目标环境：
+  - `/mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/slime/.venv-sgl0_5_9`
+- 当前事实核查结果：
+  - 该环境此刻仅安装了 `sgl_kernel` 与 `sglang_router`
+  - 尚未安装 `sglang` 主包，因此不能把它直接当成“已完成的 0.5.9 基线”使用
+- 已达成的设计结论：
+  - 采用“单仓库多版本适配”方案，而不是按版本拆多个插件仓库
+  - 但实现顺序上要先把新版本环境跑通，再收敛为统一结构
+  - 仓库后续应拆成四层：
+    - 上游基线层
+    - 公共自定义层
+    - 版本兼容层
+    - 入口装配层
+- 对现有 `0.5.2` 补丁的初步重新归因：
+  - 更可能属于公共 checkpoint 自定义的项：
+    - `GemmaRMSNorm -> RMSNorm`
+    - 去掉 `q_norm` / `k_norm`
+    - 投影层 bias 差异
+    - `attn_output_gate` 差异
+    - `num_experts=0` 走普通 MLP
+  - 更可能属于 `0.5.2` 特有 compat 的项：
+    - `layer_types` 保存与消费
+    - `ModelRunner.init_memory_pool()` dtype 同步
+    - Hybrid backend 切到稳定 `causal_conv1d_fn`
+    - 外部插件 env 接入兼容层
+- 本阶段新增文档：
+  - `docs/superpowers/specs/2026-03-20-sglang-multi-version-plugin-design.md`
+  - `docs/superpowers/plans/2026-03-20-sglang-multi-version-plugin.md`
+- 下一步：
+  - 先在 `.venv-sgl0_5_9` 中安装官方 `sglang` 主包
+  - 记录真实版本号、模型文件路径、配置文件路径与插件入口能力
+  - 再开始仓库代码重组与新版本 compat 判断
+
+### Phase 12: 新版本环境事实基线采集
+- 已完成：
+  - 在 `/mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/slime/.venv-sgl0_5_9` 中安装官方 `sglang` 主包
+- 当前环境关键信息：
+  - `sglang==0.5.9`
+  - site-packages 根目录：
+    - `/mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/slime/.venv-sgl0_5_9/lib/python3.12/site-packages/sglang`
+  - 上游模型文件：
+    - `/mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/slime/.venv-sgl0_5_9/lib/python3.12/site-packages/sglang/srt/models/qwen3_next.py`
+  - 上游配置文件：
+    - `/mnt/ssd/yulan/pretrain-linear-moe-dev-worktree/slime/.venv-sgl0_5_9/lib/python3.12/site-packages/sglang/srt/configs/qwen3_next.py`
+- 已确认的新版本差异结论：
+  - `sglang 0.5.9` 的 `sglang/srt/models/registry.py` 已经原生消费 `envs.SGLANG_EXTERNAL_MODEL_PACKAGE`
+  - 因此当前仓库中的 `sitecustomize.py` 与 `sglang_qwen3_next_plugin/env_override.py` 应明确视为 `0.5.2` 特有 compat，而不是多版本公共主路径
+- 已确认的风险结论：
+  - 新环境在 import 更深层 `sglang.srt.models.qwen3_next` 时触发了与 `vllm/_C` 相关的符号错误，并进一步 segfault
+  - 报错形态为：
+    - `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`
+  - 这说明新环境当前不仅存在 `sglang` 主包升级，还叠加了 `torch 2.9.1`、`flashinfer 0.6.3`、`sgl-kernel 0.3.21` 与旧 `vllm 0.11.0` 的运行时栈冲突
+  - 后续排障必须区分：
+    - 这是 `sglang 0.5.9` 模型逻辑问题
+    - 还是环境里残留的 `vllm` 二进制兼容问题
+- 对旧补丁去留的新证据：
+  - `SGLANG_EXTERNAL_MODEL_PACKAGE` 接入兼容层：
+    - 在 `0.5.9` 已被上游吸收
+  - `layer_types` 问题：
+    - `0.5.9` 配置文件签名中已有 `layer_types`
+    - 但 `layers_block_type` 仍在按 `full_attention_interval` 推导，尚未看到优先消费显式 `layer_types` 的证据
+    - 这意味着该问题很可能没有被彻底修掉，仍需继续验证
+- 下一步：
+  - 提取 `0.5.9` 上游基线到仓库
+  - 开始把插件组织改成多版本结构
+  - 同时优先处理新环境中的 `vllm/_C` 冲突，避免后续误把环境问题归因为插件问题
+
+### Phase 13: 新环境根因验证与多版本基础设施起步
+- 已完成的根因验证：
+  - `import sglang` 正常
+  - `import sglang.srt.configs.qwen3_next` 正常
+  - `import sglang.srt.models.registry` 在真实环境下会触发：
+    - `vllm._C.abi3.so: undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`
+    - 随后进程 segfault
+  - 直接 `import vllm._C` 也会稳定复现同一 `ImportError`
+- 已验证的单一根因假设：
+  - 新环境中 `sglang 0.5.9` 已升级到 `torch 2.9.1`
+  - 但环境仍残留 `vllm 0.11.0`
+  - 该 `vllm` 二进制扩展与当前 `torch` ABI 不兼容
+  - `sglang 0.5.9` 在导入模型 registry / model 模块时会碰到 `vllm._custom_ops`
+  - 当用临时假 `vllm` 包遮住真实 `vllm` 后：
+    - `import sglang.srt.models.registry` 可以成功
+    - `import sglang.srt.models.qwen3_next` 也可以成功
+  - 这证明当前 segfault 的根因在环境里不兼容的 `vllm`，而不是插件代码本身
+- 已落地的多版本基础设施：
+  - 新增 `sglang_qwen3_next_plugin/versioning.py`
+  - 包根 `sglang_qwen3_next_plugin/__init__.py` 改为轻量 lazy import 入口
+  - 新增 `sglang_qwen3_next_plugin/compat/`
+    - `sglang_0_5_2.py`
+    - `sglang_0_5_9.py`
+  - 新增 `0.5.9` 上游基线快照：
+    - `sglang_qwen3_next_plugin/upstream/sglang_0_5_9/qwen3_next.py`
+    - `sglang_qwen3_next_plugin/upstream/sglang_0_5_9/configs_qwen3_next.py`
+  - 新增测试：
+    - `tests/test_versioning.py`
+- 当前测试状态：
+  - `python -m pytest tests/test_versioning.py -q`
+    - `8 passed`
+  - `python test_plugin.py`
+    - 仍通过，说明现有 `0.5.2` 契约未被轻量入口改坏
+- 当前阶段结论：
+  - 仓库已经从“只有一个 0.5.2 fork 文件”迈出到“有版本键、compat 目录、上游快照目录”的第一步
+  - 接下来应继续把 `qwen3_next.py` 中的 `0.5.2` 特有 patch 向 `compat/sglang_0_5_2.py` 迁移
+  - 并开始建立新版本的装配路径
+
+### Phase 14: 多版本分发器与项目级 skill
+- 已完成的结构调整：
+  - `sglang_qwen3_next_plugin/qwen3_next.py` 已从“单版本大实现文件”改为版本分发器
+  - 当前分发规则：
+    - `0.5.2` -> `sglang_qwen3_next_plugin.variants.sglang_0_5_2`
+    - `0.5.9` -> `sglang_qwen3_next_plugin.variants.sglang_0_5_9`
+  - 现有 `0.5.2` 工作实现已复制到：
+    - `sglang_qwen3_next_plugin/variants/sglang_0_5_2.py`
+  - `0.5.9` 当前先挂载上游基线实现：
+    - `sglang_qwen3_next_plugin/variants/sglang_0_5_9.py`
+- 已完成的验证：
+  - `python -m pytest tests/test_versioning.py -q`
+    - `10 passed`
+  - `python test_plugin.py`
+    - 仍通过
+  - 在 `0.5.9` 环境中，用临时假 `vllm` 隔离 ABI 冲突后：
+    - 包根 `EntryClass` 成功命中
+      - `sglang_qwen3_next_plugin.upstream.sglang_0_5_9.qwen3_next.Qwen3NextForCausalLM`
+- 已新增项目级 skill：
+  - `.codex/skills/sglang-plugin-version-adaptation/SKILL.md`
+- 该 skill 固化的内容包括：
+  - 新版本环境事实采集
+  - 上游基线提取
+  - 公共 custom / 版本 compat 分类
+  - 环境 ABI 冲突优先排查
+  - 文档更新要求
+  - 最小验收链路
+- 当前阶段结论：
+  - 仓库已经具备真正的“按版本切换实现”的入口骨架
+  - 但 `0.5.9` 目前仍只是“上游基线挂载成功”，尚未完成公共 custom 与 compat 的逐项迁移
+- 下一步：
+  - 比对 `variants/sglang_0_5_2.py` 与 `upstream/sglang_0_5_9/qwen3_next.py`
+  - 将能确认属于公共 custom 的项开始迁移到 `0.5.9` 路径
+  - 将 `0.5.2` 特有 patch 从 `variants/sglang_0_5_2.py` 继续向 `compat/sglang_0_5_2.py` 拆出
+
+### Phase 15: `0.5.2` compat 抽离第一步
+- 已完成：
+  - 为 compat 模块新增显式接口：
+    - `sglang_qwen3_next_plugin.compat.sglang_0_5_2.apply_runtime_compat()`
+    - `sglang_qwen3_next_plugin.compat.sglang_0_5_9.apply_runtime_compat()`
+  - 已将 `0.5.2` 中三类运行时 patch 从 `variants/sglang_0_5_2.py` 抽到 `compat/sglang_0_5_2.py`：
+    - `layer_types` / `hybrid_gdn_params`
+    - hybrid linear attention `causal_conv1d_fn`
+    - `ModelRunner.init_memory_pool()` dtype patch
+  - `variants/sglang_0_5_2.py` 现已改为显式调用 `apply_runtime_compat()`
+- 新增测试：
+  - `tests/test_compat_modules.py`
+- 当前验证结果：
+  - `python -m pytest tests/test_compat_modules.py -q`
+    - `2 passed`
+  - `python -m pytest tests/test_versioning.py -q`
+    - `10 passed`
+  - `python test_plugin.py`
+    - 仍通过
+- 当前阶段结论：
+  - `0.5.2` 的“运行时 compat”已经不再完全和模型实现缠在同一文件里
+  - 这为后续继续拆分 `0.5.2` 特有逻辑，以及给 `0.5.9` 单独补 compat 提供了明确入口
+- 下一步：
+  - 开始建立 `0.5.9` 的公共 custom 路径
+  - 优先处理已确认最关键的结构性差异：
+    - RMSNorm
+    - `q_norm/k_norm`
+    - `attn_output_gate`
+    - `num_experts=0`
+
+### Phase 16: `0.5.9` 公共 custom 第一批迁移
+- 已完成：
+  - `variants/sglang_0_5_9.py` 不再只是简单 re-export 上游实现
+  - 已直接以 `0.5.9` 上游快照为基础建立本地 variant，并迁入第一批公共 custom：
+    - `GemmaRMSNorm -> RMSNorm`
+    - `attn_output_gate` 默认改为 `False`
+    - `num_experts=0` 时允许走普通 MLP 路径
+    - 移除 `q_norm/k_norm` 及其 `_apply_qk_norm` 路径
+- 新增测试：
+  - `tests/test_variant_0_5_9_source.py`
+- 当前验证结果：
+  - `python -m pytest tests/test_variant_0_5_9_source.py -q`
+    - `4 passed`
+  - `python -m pytest tests/test_compat_modules.py tests/test_versioning.py -q`
+    - `12 passed`
+  - 在 `0.5.9` 环境中，用临时假 `vllm` 隔离 ABI 冲突后：
+    - `import sglang_qwen3_next_plugin.variants.sglang_0_5_9` 成功
+    - `Qwen3NextForCausalLM.__module__ == "sglang_qwen3_next_plugin.variants.sglang_0_5_9"`
+- 当前阶段结论：
+  - `0.5.9` 已开始承载与你 checkpoint 结构绑定的公共 custom，而不再只是上游透传
+  - 但这仍只是第一批结构性迁移，尚未处理：
+    - `layer_types` compat
+    - 可能的 dtype / backend compat
+    - 真实 checkpoint 启动与生成验收
+- 下一步：
+  - 针对 `0.5.9` 单独设计并验证必要 compat
+  - 尤其优先核实 `layer_types` 是否必须打 patch
+
+### Phase 17: `0.5.9` `layer_types` compat 与第二批公共 custom
+- 已完成的 compat：
+  - `sglang_qwen3_next_plugin.compat.sglang_0_5_9.apply_runtime_compat()`
+    现在不再是空实现
+  - 当前已落地内容：
+    - 为 `Qwen3NextConfig` 接通 `layer_types`
+    - `layers_block_type` 优先消费显式 `layer_types`
+- 已完成的第二批公共 custom：
+  - `qkv_proj` 改为 `bias=True`
+  - 权重加载时跳过已删除的 `q_norm/k_norm` 参数
+  - `get_model_config_for_expert_location()` 在 `num_experts=0` 时使用 `1` 个逻辑 expert
+- 当前验证结果：
+  - `python -m pytest tests/test_variant_0_5_9_source.py -q`
+    - `7 passed`
+  - `python -m pytest tests/test_compat_modules.py tests/test_versioning.py -q`
+    - `12 passed`
+  - 在 `0.5.9` 环境里，用临时假 `vllm` 隔离 ABI 冲突后：
+    - `apply_runtime_compat()` 后构造
+      - `Qwen3NextConfig(num_hidden_layers=4, full_attention_interval=0, layer_types=[...])`
+      - 得到 `['linear_attention', 'attention', 'linear_attention', 'attention']`
+    - 说明 `layer_types` compat 动态上已经生效
+    - `import sglang_qwen3_next_plugin.variants.sglang_0_5_9` 仍成功
+- 当前阶段结论：
+  - `0.5.9` 已具备：
+    - 第一批 + 第二批公共 custom
+    - `layer_types` compat
+  - 现在剩余未验证的主要是运行时层面：
+    - 新版本是否还需要 dtype / backend compat
+    - 在隔离 `vllm` ABI 冲突后，是否能进入真实 checkpoint 启动与生成链路
+- 下一步：
+  - 优先尝试在 `0.5.9` 环境下跑最小插件接管检查
+  - 再决定是否需要新增 `0.5.9` 的 dtype / backend compat
+
+### Phase 18: `0.5.9` 最小插件接管验证
+- 已完成的运行时最小验证：
+  - 在 `0.5.9` 环境中，使用：
+    - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin`
+    - `PYTHONPATH=/tmp/fake_vllm`
+  - 运行：
+    - `python scripts/check_plugin_import.py`
+  - 结果：
+    - `resolved class: <class 'sglang_qwen3_next_plugin.variants.sglang_0_5_9.Qwen3NextForCausalLM'>`
+    - `resolved module: sglang_qwen3_next_plugin.variants.sglang_0_5_9`
+- 结论：
+  - 在隔离掉 `vllm 0.11.0` ABI 冲突后，`sglang 0.5.9` 的原生外部模型包机制已能把 registry 正确指向插件实现
+  - 这说明当前多版本分发器、`0.5.9` variant 与 `layer_types` compat 至少在“最小接管”层面已经打通
+- 本轮额外工程化收尾：
+  - `sglang_qwen3_next_plugin/qwen3_next.py` 现在会转发当前 active variant 的其它公开符号，而不只暴露 `Qwen3NextForCausalLM`
+  - 新增测试：
+    - `tests/test_dispatcher_exports.py`
+- 当前验证汇总：
+  - `python -m pytest tests/test_dispatcher_exports.py tests/test_compat_modules.py tests/test_variant_0_5_9_source.py tests/test_versioning.py -q`
+    - `20 passed`
+  - `python test_plugin.py`
+    - 通过
+- 当前剩余阻塞：
+  - 新环境真实服务启动仍受 `vllm 0.11.0` 与 `torch 2.9.1` ABI 冲突影响
+  - 在不处理该环境冲突前，只能做“隔离 `vllm`”条件下的最小导入与 registry 验证
+- 下一步：
+  - 评估是否在 `.venv-sgl0_5_9` 中移除或替换不兼容 `vllm`
+  - 然后进入 `0.5.9` 的真实服务级启动与生成验收
+
+### Phase 19: 解除 `.venv-sgl0_5_9` 的 `vllm` ABI 阻塞
+- 已完成：
+  - 从 `.venv-sgl0_5_9` 中卸载不兼容的 `vllm 0.11.0`
+- 卸载后的环境状态：
+  - `sglang==0.5.9`
+  - `torch==2.9.1`
+  - `vllm` 已不存在
+- 卸载后的直接验证：
+  - 在真实 `.venv-sgl0_5_9` 环境中，不再需要临时假 `vllm`
+  - `import sglang_qwen3_next_plugin.variants.sglang_0_5_9` 已可直接成功
+  - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin python scripts/check_plugin_import.py`
+    已在真实环境中直接通过
+  - 解析结果为：
+    - `resolved class: <class 'sglang_qwen3_next_plugin.variants.sglang_0_5_9.Qwen3NextForCausalLM'>`
+    - `resolved module: sglang_qwen3_next_plugin.variants.sglang_0_5_9`
+- 当前结论：
+  - 新环境里此前最关键的 ABI 阻塞已经解除
+  - 现在可以开始不依赖临时假包，直接尝试 `0.5.9` 的真实服务启动
+- 当前剩余噪音：
+  - `sglang` 自身扫描某些模型模块时，仍会输出与缺少 `vllm._custom_ops`、部分 `transformers` 模块缺失相关的 warning
+  - 这些 warning 目前不影响 `Qwen3NextForCausalLM` 插件接管结论
+- 下一步：
+  - 尝试 `0.5.9` 环境下的真实 `launch_server`
+  - 看是否还会触发新的 dtype / backend 运行时缺口
+
+### Phase 20: `0.5.9` 真实服务验收通过
+- 已完成：
+  - 在 `.venv-sgl0_5_9` 中直接启动真实服务：
+    - `python -m sglang.launch_server`
+    - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin`
+    - 测试 checkpoint：
+      - `/mnt/ssd/yulan/cache/models/O2iginal/all_mcore_checkpoints/Dist-mathcode10b-s1randg-sch1-CPT-200b-stage2-r640k-GDN2.9b-A7-12_20_21_23_46_48_49-sl32768bs128lr2e5-2e5/merged_10ckpts_iter_38144-hf_to_iter_47683-hf_mean`
+- 真实运行时观测：
+  - 服务已穿过：
+    - 权重加载
+    - Mamba cache / KV cache 分配
+    - cuda graph capture
+  - 未在 `0.5.9` 上再次出现此前 `0.5.2` 中那类启动期 dtype/backend 崩溃
+- 真实服务级验证：
+  - `/get_model_info` 正常返回
+  - `python scripts/validate_generation.py --host 127.0.0.1 --port 30110`
+    - 通过
+  - `python scripts/validate_logprob.py --host 127.0.0.1 --port 30110`
+    - 通过
+  - `python scripts/run_acceptance.py --host 127.0.0.1 --port 30110`
+    - 返回 `ALL CHECKS PASSED`
+- 当前阶段结论：
+  - `sglang 0.5.9` 版本的插件适配已经达到与 `0.5.2` 同等级别的验收闭环：
+    - 插件发现
+    - registry 接管
+    - 自然语言生成
+    - logprob / 近似 lm loss
+- 残余事项：
+  - registry 扫描时仍会出现部分上游无关模型的 import warning
+  - 这类 warning 当前不影响 `Qwen3NextForCausalLM` 插件接管与验收结果
+  - `30110` 端口上的服务在本轮结束时仍存活，若后续不需要可由使用者自行回收
+
+### Phase 21: 项目级 skill 经验回灌
+- 已完成：
+  - 保持项目级 skill 路径仍为：
+    - `.codex/skills/sglang-plugin-version-adaptation/SKILL.md`
+  - 未改为 `.agent` 方案
+- 本轮补强内容：
+  - 加入“旧版本上游快照也应收敛到 `upstream/sglang_x_y_z/`”的要求
+  - 加入环境 ABI 冲突的明确处理顺序：
+    - 先验证 `vllm._C`
+    - 必要时卸载或替换不兼容包
+  - 加入真实服务级验收命令：
+    - `python scripts/check_plugin_import.py`
+    - `python scripts/run_acceptance.py --host 127.0.0.1 --port 30110`
+    - `python scripts/validate_generation.py`
+    - `python scripts/validate_logprob.py`
+  - 加入当前仓库已验证事实：
+    - `0.5.9` 的 `layer_types` 仍需要 compat
+    - `.venv-sgl0_5_9` 的 `vllm 0.11.0` 与 `torch 2.9.1` ABI 冲突
+    - 卸载该 `vllm` 后，`0.5.9` 完整验收通过
+  - 加入升级提醒：
+    - 不要默认继承 `0.5.2` 的 dtype patch / hybrid backend patch
+- 当前验证结果：
+  - `python -m pytest tests/test_skill_layout.py -q`
+    - `2 passed`
+
+### Phase 22: Release 收尾
+- 已完成：
+  - 版本号升级到 `0.2.0`
+  - README 改为以多版本结构与双版本验收结果为主
+  - `changelog.md` 从“未发布”切到 `0.2.0 - 2026-03-20`
+- 当前 release 结论：
+  - `sglang 0.5.2`：完整验收通过
+  - `sglang 0.5.9`：完整验收通过
+  - 项目级 skill 已根据本次真实适配经验更新

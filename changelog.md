@@ -7,7 +7,11 @@
 
 ## 记录格式
 
-### 未发布
+### 0.2.0 - 2026-03-20
+- 发布说明：
+  - 首个多版本 release
+  - 完成 `sglang 0.5.2` 与 `sglang 0.5.9` 双版本适配
+  - `0.5.9` 已通过真实服务级生成与 logprob 验收
 - 变更项：收缩包根插件入口
   - 分类：基础设施
   - 内容：`sglang_qwen3_next_plugin/__init__.py` 仅保留 `Qwen3NextForCausalLM` 与 `EntryClass` 导出
@@ -18,6 +22,104 @@
   - 内容：新增 `sglang_qwen3_next_plugin/qwen3_next_upstream.py`
   - 原因：以后所有自定义改动都要相对该基线进行对照和复核
   - 升级复核：升版时直接替换为新版本上游文件，并逐项比对插件偏差
+  - 0.5.9 状态：
+    - 已新增 `sglang_qwen3_next_plugin/upstream/sglang_0_5_9/qwen3_next.py`
+    - 已新增 `sglang_qwen3_next_plugin/upstream/sglang_0_5_9/configs_qwen3_next.py`
+    - 后续新增版本时应沿用“上游模型 + 上游配置快照”这一最小基线集合
+- 变更项：新增多版本版本管理基础设施
+  - 分类：基础设施
+  - 内容：
+    - 新增 `sglang_qwen3_next_plugin/versioning.py`
+    - 新增 `sglang_qwen3_next_plugin/compat/sglang_0_5_2.py`
+    - 新增 `sglang_qwen3_next_plugin/compat/sglang_0_5_9.py`
+    - 包根改为 lazy import 入口，避免轻量工具导入时强制加载重型模型实现
+  - 原因：
+    - 为了把“公共 custom”和“版本 compat”显式分层
+    - 为了让新版本适配不再依赖隐含约定或直接修改单一 fork 文件
+  - 升级复核：
+    - 每新增一个 `sglang` 版本，都要同步新增上游快照与 compat 模块
+    - 保持版本键与目录命名一致，例如 `sglang_0_5_9`
+- 变更项：抽离 `0.5.2` 运行时 compat 接口
+  - 分类：基础设施 / P2 重组
+  - 内容：
+    - 新增 `sglang_qwen3_next_plugin.compat.sglang_0_5_2.apply_runtime_compat()`
+    - `variants/sglang_0_5_2.py` 不再内联执行三类运行时 patch，而是显式调用 compat 接口
+  - 原因：
+    - 让 `0.5.2` 特有补丁开始与模型主体分离
+    - 为 `0.5.9` 单独判断 compat 去留提供清晰边界
+  - 升级复核：
+    - 后续若继续抽离 `0.5.2` 其他 patch，应优先放入 `compat/sglang_0_5_2.py`
+    - 若 `0.5.9+` 需要类似补丁，应单独写入对应版本 compat，而不是回塞到公共实现
+- 变更项：建立 `0.5.9` 第一批公共 custom
+  - 分类：P1 / checkpoint 结构定制
+  - 内容：
+    - `variants/sglang_0_5_9.py` 改为真实 variant 文件，不再只是 re-export 上游实现
+    - 使用 `RMSNorm` 替代 `GemmaRMSNorm`
+    - `attn_output_gate` 默认改为 `False`
+    - 支持 `num_experts=0`
+    - 移除 `q_norm/k_norm`
+  - 原因：
+    - 这些差异与当前 checkpoint 结构保持一致
+    - 也是旧版本工作实现中最明确、最稳定的一批公共 custom
+  - 升级复核：
+    - 检查未来上游是否已支持普通 `RMSNorm`
+    - 检查未来上游是否仍强依赖 `q_norm/k_norm`
+    - 检查 `attn_output_gate` 默认值是否仍需由 checkpoint 覆盖
+    - 检查 `num_experts=0` 是否已原生支持
+- 变更项：新增 `0.5.9` `layer_types` compat
+  - 分类：P2 / 运行时兼容
+  - 内容：
+    - `compat/sglang_0_5_9.py` 现在会为 `Qwen3NextConfig` 接通 `layer_types`
+    - `layers_block_type` 优先消费显式 `layer_types`
+  - 原因：
+    - `0.5.9` 虽然在 config 签名中出现了 `layer_types`
+    - 但上游实现仍按 `full_attention_interval` 推导 `layers_block_type`
+    - 对显式混合层布局 checkpoint 来说，这仍然不够
+  - 升级复核：
+    - 若未来上游开始原生优先读取 `layer_types`，应删除该 compat
+- 变更项：建立 `0.5.9` 第二批公共 custom
+  - 分类：P1 / checkpoint 结构定制
+  - 内容：
+    - `qkv_proj` 改为 `bias=True`
+    - 权重加载跳过已删除的 `q_norm/k_norm`
+    - `get_model_config_for_expert_location()` 在 `num_experts=0` 时兜底为 `1` 个逻辑 expert
+  - 原因：
+    - 这些差异与当前 checkpoint 和旧版已跑通实现保持一致
+    - 能避免结构差异在权重加载和 expert-location 计算阶段重新暴露
+  - 升级复核：
+    - 检查未来上游是否已支持带 bias 的 `qkv_proj`
+    - 检查未来上游在移除 `q_norm/k_norm` 时是否仍需要 loader 跳过逻辑
+    - 检查未来上游是否已原生支持 `num_experts=0` 的 expert-location 计算
+- 变更项：分发器转发 active variant 公开符号
+  - 分类：基础设施
+  - 内容：
+    - `sglang_qwen3_next_plugin/qwen3_next.py` 除了导出 `Qwen3NextForCausalLM` 外，也会通过 `__getattr__` 转发 active variant 的其它符号
+  - 原因：
+    - `0.5.9` 上游相关模块在扫描时不仅引用主模型类，也可能引用 `Qwen3NextModel`、`gdn_with_output` 等符号
+    - 若分发器只暴露单个类，会在 registry 扫描阶段产生额外插件相关 warning
+  - 升级复核：
+    - 若未来分发器改为更强约束的公开 API，需要确认上游相关模块不再从 `qwen3_next` 导入额外符号
+- 变更项：`.venv-sgl0_5_9` 移除不兼容 `vllm`
+  - 分类：环境事实
+  - 内容：
+    - 从 `0.5.9` 目标环境中卸载 `vllm 0.11.0`
+  - 原因：
+    - 该包与当前 `torch 2.9.1` ABI 不兼容
+    - 会导致导入 `registry` / `qwen3_next` 时触发 `vllm._C` 未定义符号并 segfault
+  - 升级复核：
+    - 若未来需要在同一环境重新安装 `vllm`，必须确保它与当前 `torch` ABI 匹配
+    - 若重新安装后再次出现 `vllm._C` 未定义符号，应优先怀疑环境二进制兼容性，而不是插件逻辑
+- 变更项：确认 `0.5.9` 当前不需要沿用 `0.5.2` 的 dtype / hybrid backend compat
+  - 分类：升级结论
+  - 内容：
+    - 在当前 `sglang 0.5.9` 环境与测试 checkpoint 上，服务已完成真实启动、cache 分配、cuda graph capture 与生成验收
+    - 当前未再引入：
+      - `ModelRunner.init_memory_pool()` dtype patch
+      - hybrid linear attention backend 强制切换 patch
+  - 原因：
+    - 真实服务级验证已经通过，说明 `0.5.2` 中的这两类 compat 目前没有证据表明在 `0.5.9` 仍然必须保留
+  - 升级复核：
+    - 若未来 `0.5.9+` 环境在真实服务启动时重新出现 dtype / backend 崩溃，再单独新增对应版本 compat
 - 变更项：补齐环境变量主入口接入层
   - 分类：P2 / 运行时兼容
   - 内容：新增 `sitecustomize.py` 与 `sglang_qwen3_next_plugin/env_override.py`
@@ -26,6 +128,9 @@
     - 先检查上游新版本是否原生支持外部模型包
     - 若已原生支持，应优先删除这层兼容逻辑
     - 若仍不支持，再验证 alias 机制是否仍然成立
+  - 0.5.9 状态：
+    - 已确认上游 `sglang/srt/models/registry.py` 原生消费 `SGLANG_EXTERNAL_MODEL_PACKAGE`
+    - 因此该项应保留为 `0.5.2` 特有 compat，不应继续作为新版本主路径
 - 变更项：显式接通 `layer_types`
   - 分类：P2 / 运行时兼容
   - 内容：
@@ -40,6 +145,10 @@
     - 检查上游新版本是否已在 `Qwen3NextConfig` 中保存 `layer_types`
     - 检查 `layers_block_type` 是否已优先读取 `layer_types`
     - 若已修复，应删除插件中的这层 patch，避免重复覆盖
+  - 0.5.9 状态：
+    - `Qwen3NextConfig.__init__` 签名已包含 `layer_types`
+    - 但当前 `layers_block_type` 仍在按 `full_attention_interval` 推导
+    - 尚未看到优先消费显式 `layer_types` 的证据，因此暂不能判定该补丁已被上游吸收
 - 变更项：将 hybrid linear attention backend 切到稳定 `causal_conv1d_fn`
   - 分类：P2 / 运行时兼容
   - 内容：把 `sglang.srt.layers.attention.hybrid_linear_attn_backend.causal_conv1d_fn` 指向 `sglang.srt.layers.attention.mamba.causal_conv1d.causal_conv1d_fn`

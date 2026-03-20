@@ -1,0 +1,25 @@
+import importlib
+
+
+def test_sglang_0_5_2_runtime_compat_contract() -> None:
+    compat = importlib.import_module("sglang_qwen3_next_plugin.compat.sglang_0_5_2")
+    applied = compat.apply_runtime_compat()
+
+    assert "layer_types" in applied
+    assert "hybrid_conv_backend" in applied
+    assert "model_runner_dtype" in applied
+
+    from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+    import sglang.srt.layers.attention.hybrid_linear_attn_backend as backend
+    import sglang.srt.model_executor.model_runner as model_runner_module
+
+    assert getattr(Qwen3NextConfig, "_sglang_qwen3_next_plugin_layer_types_patch", False)
+    assert getattr(backend, "_sglang_qwen3_next_plugin_conv_patch", False)
+    assert getattr(model_runner_module, "_sglang_qwen3_next_plugin_dtype_patch", False)
+
+
+def test_sglang_0_5_9_runtime_compat_contract() -> None:
+    compat = importlib.import_module("sglang_qwen3_next_plugin.compat.sglang_0_5_9")
+    applied = compat.apply_runtime_compat()
+
+    assert "layer_types" in applied

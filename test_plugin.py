@@ -10,12 +10,20 @@
 import importlib
 import os
 import sys
+from importlib.metadata import version as package_version
+from pathlib import Path
 
 
 def prepare_env() -> None:
     os.environ.setdefault("HOME", "/tmp")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def current_version_key() -> str:
+    from sglang_qwen3_next_plugin.versioning import get_supported_version_key
+
+    return get_supported_version_key(package_version("sglang"))
 
 
 def test_entryclass_contract() -> None:
@@ -34,9 +42,29 @@ def test_entryclass_contract() -> None:
 
 def test_upstream_baseline_contract() -> None:
     prepare_env()
-    module = importlib.import_module("sglang_qwen3_next_plugin.qwen3_next_upstream")
+    from sglang_qwen3_next_plugin.versioning import (
+        get_supported_version_key,
+        get_upstream_variant_paths,
+    )
+
+    version_key = get_supported_version_key(package_version("sglang"))
+    upstream_paths = get_upstream_variant_paths(
+        Path(os.path.dirname(os.path.abspath(__file__)))
+    )
+    upstream_path = upstream_paths[version_key]
+
+    if version_key == "sglang_0_5_2":
+        module = importlib.import_module(
+            "sglang_qwen3_next_plugin.upstream.sglang_0_5_2.qwen3_next"
+        )
+    else:
+        module = importlib.import_module(
+            "sglang_qwen3_next_plugin.upstream.sglang_0_5_9.qwen3_next"
+        )
+
     assert hasattr(module, "Qwen3NextForCausalLM"), "缺少上游基线模型类"
     print("✓ 上游基线模块已存在")
+    print(f"✓ Upstream file: {upstream_path}")
     print(f"✓ Upstream class: {module.Qwen3NextForCausalLM}")
 
 
@@ -66,6 +94,9 @@ def test_layer_types_override_contract() -> None:
 
 def test_conv_backend_override_contract() -> None:
     prepare_env()
+    if current_version_key() != "sglang_0_5_2":
+        print("~ 当前版本不要求 hybrid linear attention backend 覆盖")
+        return
     importlib.import_module("sglang_qwen3_next_plugin")
     import sglang.srt.layers.attention.hybrid_linear_attn_backend as backend
     from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn
@@ -78,13 +109,19 @@ def test_conv_backend_override_contract() -> None:
 
 def test_hybrid_gdn_conv_dtype_contract() -> None:
     prepare_env()
+    if current_version_key() != "sglang_0_5_2":
+        print("~ 当前版本不要求 hybrid_gdn_params conv dtype 覆盖")
+        return
     importlib.import_module("sglang_qwen3_next_plugin")
+    from sglang_qwen3_next_plugin.versioning import get_active_variant_module_name
     from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-    import sglang_qwen3_next_plugin.qwen3_next as plugin_qwen3_next
     import torch
 
-    original_get_attention_tp_size = plugin_qwen3_next.get_attention_tp_size
-    plugin_qwen3_next.get_attention_tp_size = lambda: 1
+    variant_module_name = get_active_variant_module_name(package_version("sglang"))
+    compat_module_name = variant_module_name.replace(".variants.", ".compat.")
+    compat_module = importlib.import_module(compat_module_name)
+    original_get_attention_tp_size = compat_module.get_attention_tp_size
+    compat_module.get_attention_tp_size = lambda: 1
     cfg = Qwen3NextConfig(
         num_hidden_layers=2,
         full_attention_interval=1,
@@ -96,11 +133,14 @@ def test_hybrid_gdn_conv_dtype_contract() -> None:
         assert conv_dtype == torch.float16, f"conv_state dtype 异常: {conv_dtype}"
         print("✓ hybrid_gdn_params 会跟随模型 dtype 选择 conv_state dtype")
     finally:
-        plugin_qwen3_next.get_attention_tp_size = original_get_attention_tp_size
+        compat_module.get_attention_tp_size = original_get_attention_tp_size
 
 
 def test_model_runner_dtype_patch_contract() -> None:
     prepare_env()
+    if current_version_key() != "sglang_0_5_2":
+        print("~ 当前版本不要求 ModelRunner dtype patch")
+        return
     importlib.import_module("sglang_qwen3_next_plugin")
     import sglang.srt.model_executor.model_runner as model_runner_module
 

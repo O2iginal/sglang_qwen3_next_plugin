@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import (
+    divide,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,

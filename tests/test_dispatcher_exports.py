@@ -12,3 +12,11 @@ def test_dispatcher_reexports_variant_symbols() -> None:
 
     if hasattr(variant, "gdn_with_output"):
         assert dispatcher.gdn_with_output is variant.gdn_with_output
+
+
+def test_sglang_0_5_2_variant_keeps_divide_symbol() -> None:
+    variant = importlib.import_module(
+        "sglang_qwen3_next_plugin.variants.sglang_0_5_2"
+    )
+
+    assert hasattr(variant, "divide")

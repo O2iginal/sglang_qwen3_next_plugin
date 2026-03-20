@@ -1,14 +1,12 @@
-# copy from sglang/srt/models/qwen3_next.py v0.5.2
 import enum
 import logging
-import os
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.qwen3_next import HybridLayerType, Qwen3NextConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -24,7 +22,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -49,162 +47,12 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.utils import add_prefix, is_cuda, make_layers, set_weight_attrs
-from sglang.srt.layers.attention.mamba.causal_conv1d import (
-    causal_conv1d_fn as stable_causal_conv1d_fn,
-)
-import sglang.srt.layers.attention.hybrid_linear_attn_backend as hybrid_linear_attn_backend
-import sglang.srt.model_executor.model_runner as model_runner_module
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
-_PLUGIN_BANNER_PRINTED = False
 
 import triton
 import triton.language as tl
-
-
-def _print_plugin_banner_once() -> None:
-    global _PLUGIN_BANNER_PRINTED
-    if _PLUGIN_BANNER_PRINTED:
-        return
-    _PLUGIN_BANNER_PRINTED = True
-    print(
-        "\033[92m"
-        + "=" * 80
-        + "\n"
-        + "  ✓ SGLang Qwen3 Next Plugin Loaded Successfully!\n"
-        + "  ✓ Custom model implementation is active.\n"
-        + "=" * 80
-        + "\033[0m"
-    )
-
-
-def _plugin_layers_block_type(config: Qwen3NextConfig):
-    explicit_layer_types = getattr(config, "layer_types", None)
-    if explicit_layer_types is not None:
-        if len(explicit_layer_types) != config.num_hidden_layers:
-            raise ValueError(
-                "config.layer_types length does not match num_hidden_layers: "
-                f"{len(explicit_layer_types)} != {config.num_hidden_layers}"
-            )
-        mapping = {
-            "full_attention": HybridLayerType.full_attention.value,
-            HybridLayerType.full_attention.value: HybridLayerType.full_attention.value,
-            "linear_attention": HybridLayerType.linear_attention.value,
-            HybridLayerType.linear_attention.value: HybridLayerType.linear_attention.value,
-            "swa_attention": HybridLayerType.swa_attention.value,
-            HybridLayerType.swa_attention.value: HybridLayerType.swa_attention.value,
-            "mamba": HybridLayerType.mamba2.value,
-            HybridLayerType.mamba2.value: HybridLayerType.mamba2.value,
-        }
-        try:
-            return [mapping[layer_type] for layer_type in explicit_layer_types]
-        except KeyError as exc:
-            raise ValueError(f"unsupported layer_types entry: {exc.args[0]}") from exc
-
-    full_attention_interval = getattr(config, "full_attention_interval", None)
-    if not full_attention_interval:
-        raise ValueError(
-            "full_attention_interval must be non-zero when layer_types is absent"
-        )
-
-    layer_type_list = []
-    for layer_idx in range(config.num_hidden_layers):
-        if (layer_idx + 1) % full_attention_interval == 0:
-            layer_type_list.append(HybridLayerType.full_attention.value)
-        else:
-            layer_type_list.append(HybridLayerType.linear_attention.value)
-    return layer_type_list
-
-
-def _plugin_hybrid_gdn_params(config: Qwen3NextConfig):
-    world_size = get_attention_tp_size()
-    conv_dim = (
-        config.linear_key_head_dim * config.linear_num_key_heads * 2
-        + config.linear_value_head_dim * config.linear_num_value_heads
-    )
-    conv_state_shape = (
-        divide(conv_dim, world_size),
-        config.linear_conv_kernel_dim - 1,
-    )
-
-    temporal_state_shape = (
-        divide(config.linear_num_value_heads, world_size),
-        config.linear_key_head_dim,
-        config.linear_value_head_dim,
-    )
-
-    dtype_value = getattr(config, "torch_dtype", None)
-    if dtype_value is None:
-        dtype_value = getattr(config, "dtype", None)
-    dtype_map = {
-        "float16": torch.float16,
-        "torch.float16": torch.float16,
-        torch.float16: torch.float16,
-        "bfloat16": torch.bfloat16,
-        "torch.bfloat16": torch.bfloat16,
-        torch.bfloat16: torch.bfloat16,
-        "float32": torch.float32,
-        "torch.float32": torch.float32,
-        torch.float32: torch.float32,
-    }
-    conv_dtype = dtype_map.get(dtype_value, torch.bfloat16)
-
-    ssm_dtype_map = {
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    ssm_dtype = ssm_dtype_map[os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32")]
-    mamba_layers = [
-        idx
-        for idx, type_value in enumerate(config.layers_block_type)
-        if type_value == HybridLayerType.linear_attention.value
-    ]
-    return (
-        conv_state_shape,
-        temporal_state_shape,
-        conv_dtype,
-        ssm_dtype,
-        mamba_layers,
-    )
-
-
-if not getattr(Qwen3NextConfig, "_sglang_qwen3_next_plugin_layer_types_patch", False):
-    _original_qwen3_next_config_init = Qwen3NextConfig.__init__
-
-    def _patched_qwen3_next_config_init(self, *args, layer_types=None, **kwargs):
-        _original_qwen3_next_config_init(
-            self, *args, layer_types=layer_types, **kwargs
-        )
-        self.layer_types = layer_types
-
-    Qwen3NextConfig.__init__ = _patched_qwen3_next_config_init
-    Qwen3NextConfig.layers_block_type = property(_plugin_layers_block_type)
-    Qwen3NextConfig.hybrid_gdn_params = property(_plugin_hybrid_gdn_params)
-    Qwen3NextConfig._sglang_qwen3_next_plugin_layer_types_patch = True
-
-
-if not getattr(
-    hybrid_linear_attn_backend, "_sglang_qwen3_next_plugin_conv_patch", False
-):
-    hybrid_linear_attn_backend.causal_conv1d_fn = stable_causal_conv1d_fn
-    hybrid_linear_attn_backend._sglang_qwen3_next_plugin_conv_patch = True
-
-
-if not getattr(model_runner_module, "_sglang_qwen3_next_plugin_dtype_patch", False):
-    _original_init_memory_pool = model_runner_module.ModelRunner.init_memory_pool
-
-    def _patched_init_memory_pool(self, *args, **kwargs):
-        if getattr(self, "is_hybrid_gdn", False):
-            hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
-            model_dtype = getattr(getattr(self, "model_config", None), "dtype", None)
-            if hf_config is not None and model_dtype is not None:
-                hf_config.torch_dtype = model_dtype
-                hf_config.dtype = model_dtype
-        return _original_init_memory_pool(self, *args, **kwargs)
-
-    model_runner_module.ModelRunner.init_memory_pool = _patched_init_memory_pool
-    model_runner_module._sglang_qwen3_next_plugin_dtype_patch = True
 
 
 @triton.jit
@@ -644,9 +492,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self.config = config
         self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
 
-        # MODIFIED: Support num_experts=0 to use regular MLP instead of MoE
         # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
+        self.is_layer_sparse = True
         is_previous_layer_sparse = True
         self.layer_id = layer_id
 
@@ -671,9 +518,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.layer_communicator = LayerCommunicator(
@@ -755,8 +601,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
-        # MODIFIED: Default disable attn_output_gate (changed from True to False)
-        self.attn_output_gate = getattr(config, "attn_output_gate", False)
+        self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -771,13 +616,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),  # see impl of get_rope
         )
 
-        # MODIFIED: qkv_proj default bias=True, o_proj default bias=False
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=True,
+            bias=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -802,9 +646,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # MODIFIED: Support num_experts=0 to use regular MLP instead of MoE
         # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
+        self.is_layer_sparse = True
         is_previous_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -828,13 +671,13 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
-        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # MODIFIED: Removed q_norm and k_norm (lines 680-682)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -845,7 +688,27 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
-    # MODIFIED: Removed _apply_qk_norm method (q_norm and k_norm are removed)
+    def _apply_qk_norm(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # overlap qk norm
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            with torch.cuda.stream(self.alt_stream):
+                k_by_head = k.reshape(-1, self.head_dim)
+                k_by_head = self.k_norm(k_by_head)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            q_by_head = q.reshape(-1, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            k_by_head = k.reshape(-1, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
 
     def self_attention(
         self,
@@ -867,7 +730,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # MODIFIED: Removed q_norm and k_norm application
+        q, k = self._apply_qk_norm(q, k)
+
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -953,8 +817,7 @@ class Qwen3NextModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
 
-        # MODIFIED: Use RMSNorm instead of GemmaRMSNorm
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
     def forward(
@@ -1011,7 +874,6 @@ class Qwen3NextForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        _print_plugin_banner_once()
         self.config = config
         self.pp_group = get_pp_group()
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
@@ -1101,11 +963,6 @@ class Qwen3NextForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # MODIFIED: Skip qkqkv_proj and q_norm/k_norm related parameters
-            # These were removed in our custom implementation
-            if "qkqkv_proj" in name or "q_norm" in name or "k_norm" in name:
-                continue
-
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
@@ -1161,13 +1018,6 @@ class Qwen3NextForCausalLM(nn.Module):
                         continue
                     # if is_pp_missing_parameter(name, self):
                     #     continue
-                    
-                    # MODIFIED: Skip parameters that don't exist in the model
-                    # This handles cases where weight files contain parameters that were removed
-                    # (e.g., qkqkv_proj related to removed q_norm/k_norm)
-                    if name not in params_dict:
-                        # Skip parameters that don't exist (e.g., qkqkv_proj after removing q_norm/k_norm)
-                        continue
 
                     param = params_dict[name]
                     weight_loader = getattr(
@@ -1179,15 +1029,9 @@ class Qwen3NextForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        # MODIFIED: When num_experts=0 (non-MoE model), use 1 as num_logical_experts
-        # This is necessary because SGLang's expert location computation requires
-        # at least 1 logical expert. For non-MoE models, we treat the regular MLP
-        # as a single expert.
-        num_experts = getattr(config, "num_experts", 0)
-        num_logical_experts = num_experts if num_experts > 0 else 1
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=num_logical_experts,
+            num_logical_experts=config.num_experts,
             num_groups=None,
         )
 

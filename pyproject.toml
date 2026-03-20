@@ -20,3 +20,6 @@ dev = [
     "black",
     "ruff",
 ]
+
+[tool.setuptools]
+py-modules = ["sitecustomize"]

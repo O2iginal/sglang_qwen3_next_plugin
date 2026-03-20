@@ -1,0 +1,102 @@
+# SGLang Qwen3 Next Plugin 变更记录
+
+## 目的
+- 记录插件相对上游 `sglang` 的每一项有意偏差。
+- 说明每一项偏差为什么存在。
+- 说明未来升级 SGLang 时该如何复核这些偏差。
+
+## 记录格式
+
+### 未发布
+- 变更项：收缩包根插件入口
+  - 分类：基础设施
+  - 内容：`sglang_qwen3_next_plugin/__init__.py` 仅保留 `Qwen3NextForCausalLM` 与 `EntryClass` 导出
+  - 原因：避免自动注册、退出钩子与全局 patch 混入插件发现流程，先验证原生插件入口
+  - 升级复核：确认未来 SGLang 仍通过模块级 `EntryClass` 发现外部模型
+- 变更项：建立上游基线文件
+  - 分类：基础设施
+  - 内容：新增 `sglang_qwen3_next_plugin/qwen3_next_upstream.py`
+  - 原因：以后所有自定义改动都要相对该基线进行对照和复核
+  - 升级复核：升版时直接替换为新版本上游文件，并逐项比对插件偏差
+- 变更项：补齐环境变量主入口接入层
+  - 分类：P2 / 运行时兼容
+  - 内容：新增 `sitecustomize.py` 与 `sglang_qwen3_next_plugin/env_override.py`
+  - 原因：目标环境中的 `sglang 0.5.2` 本地实现未直接消费 `SGLANG_EXTERNAL_MODEL_PACKAGE`，需要在 Python 启动早期把 `sglang.srt.models.qwen3_next` 别名到插件实现
+  - 升级复核：
+    - 先检查上游新版本是否原生支持外部模型包
+    - 若已原生支持，应优先删除这层兼容逻辑
+    - 若仍不支持，再验证 alias 机制是否仍然成立
+- 变更项：显式接通 `layer_types`
+  - 分类：P2 / 运行时兼容
+  - 内容：
+    - 为 `Qwen3NextConfig` 补上 `layer_types` 保存逻辑
+    - 重写 `layers_block_type`，优先使用 checkpoint 显式给出的 `layer_types`
+    - 删除“把 `full_attention_interval=0` 强改为 `1`”的旧兜底
+  - 原因：
+    - 目标 checkpoint 的 `config.json` 明确提供了 56 层的混合层布局
+    - 当前目标环境中的 `sglang 0.5.2` 实现没有真正使用这个字段
+    - 如果把 `full_attention_interval=0` 改成 `1`，会把真实层布局改坏，导致模型语义错误
+  - 升级复核：
+    - 检查上游新版本是否已在 `Qwen3NextConfig` 中保存 `layer_types`
+    - 检查 `layers_block_type` 是否已优先读取 `layer_types`
+    - 若已修复，应删除插件中的这层 patch，避免重复覆盖
+- 变更项：将 hybrid linear attention backend 切到稳定 `causal_conv1d_fn`
+  - 分类：P2 / 运行时兼容
+  - 内容：把 `sglang.srt.layers.attention.hybrid_linear_attn_backend.causal_conv1d_fn` 指向 `sglang.srt.layers.attention.mamba.causal_conv1d.causal_conv1d_fn`
+  - 原因：
+    - 在真实 `linear_attention` 路径上，Triton 版 `causal_conv1d` 对当前模型触发编译期 dtype 分支错误
+    - 切换到稳定版后，能够继续验证真实混合层路径
+  - 升级复核：
+    - 若上游 Triton 路径已修复，应优先移除此 patch，回归上游默认实现
+    - 若仍未修复，再确认稳定版 `causal_conv1d_fn` 的接口签名是否保持兼容
+- 变更项：同步 Hybrid GDN cache 分配 dtype
+  - 分类：P2 / 运行时兼容
+  - 内容：
+    - 在 `ModelRunner.init_memory_pool()` 入口，把 `hf_config.torch_dtype` 与 `hf_config.dtype` 同步为 `self.model_config.dtype`
+    - 保证 `config.hybrid_gdn_params` 在分配 `conv_state` 时读取到真实运行 dtype
+  - 原因：
+    - 当前 SGLang 会在外层把模型从 `float32` 下采样到 `float16`
+    - 但原始 `hf_config` 仍保留 `float32`
+    - 这会让 `conv_state` 按错误 dtype 分配，并在 `linear_attention` 前向中触发 `conv_states_.scalar_type() == input_type` 断言失败
+  - 升级复核：
+    - 检查上游 `ModelRunner.init_memory_pool()` 是否已经在分配前同步 `hf_config` 与真实运行 dtype
+    - 检查 `hybrid_gdn_params` 是否已直接接受外层 `model_config.dtype`
+    - 若上游已修复，应删除插件中的这层同步 patch
+- 变更项：收敛插件成功横幅打印
+  - 分类：基础设施
+  - 内容：将 `Qwen3NextForCausalLM.__init__` 中的成功横幅改为“每个进程只打印一次”
+  - 原因：当前服务会在多进程/多次构造下重复实例化模型类，原始 `print` 会刷屏，不利于排障
+  - 升级复核：
+    - 若上游未来提供更合适的插件加载日志钩子，可删除这层辅助横幅
+- 变更项：新增自动化生成验收脚本
+  - 分类：基础设施
+  - 内容：新增 `scripts/validate_generation.py`
+  - 原因：升级 SGLang 后需要快速重复验证“能否返回可读自然语言”，不应依赖手工拼接请求
+  - 升级复核：
+    - 确认 `/generate` 接口请求体与返回字段仍兼容
+    - 如接口有变化，仅调整脚本，不应影响核心模型实现
+- 变更项：新增 logprob / 近似 lm loss 验证脚本
+  - 分类：基础设施
+  - 内容：新增 `scripts/validate_logprob.py`
+  - 原因：
+    - 用户验收标准不仅包含“能生成自然语言”，也包含“自然语言 lm loss 为正常值”
+    - 当前服务已支持 `return_logprob`，可直接基于 prompt token logprob 做近似数值检查
+  - 升级复核：
+    - 确认 `/generate` 仍支持 `return_logprob` 与 `logprob_start_len`
+    - 确认返回结构中仍包含 `meta_info.input_token_logprobs`
+    - 若接口变化，仅调整脚本，不应回退核心模型补丁
+- 变更项：新增串联验收脚本
+  - 分类：基础设施
+  - 内容：新增 `scripts/run_acceptance.py`
+  - 原因：升级后需要一条命令串联“契约检查、registry 接管、生成验收、logprob 验收”
+  - 升级复核：
+    - 若各子脚本参数或路径变化，仅更新编排脚本
+    - 保持轻量模式与完整模式都可单独运行
+
+## 升级核对模板
+- 上游 SGLang 版本：
+- 插件目标版本：
+- 上游基线文件：
+- 已复核本地自定义补丁：
+- 已完成运行时验证：
+- 剩余问题：
